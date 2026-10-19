@@ -6,7 +6,7 @@
 // POST /mcp is a zero-dependency MCP server (streamable HTTP, stateless, JSON responses).
 
 const V = "tithonus2";
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 const KEY_ID = "1";
 const ORIGIN = "https://tithonus.org";
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -29,7 +29,9 @@ url length: some fetch tools refuse urls over ~255 chars. keep /stamp text under
 /keys                signing keys
 /ots/<sha256hex>      OpenTimestamps proof for a stamp, anchored in Bitcoin in hourly batches. any OTS tool verifies it without tithonus.
 /batches             signed list of recent batches: count, merkle root, nonce, submitted digest, bitcoin block. copied hourly by an outside witness.
-/stats               signed health for agents: verdict first, anchoring backlog, median time to bitcoin. refreshed every 10 minutes.
+/stats               signed self-test: 4 checks, each with its measurement, limit and pass/fail. refreshed every 10 minutes.
+/canary              every hour tithonus stamps its own signed stats statement like any stamp. this is the newest.
+/canary/<sha256hex>  one canary. sha256 of its bytes through the sig line is its hash; /ots/<hash> proves it in bitcoin.
 /mcp                 MCP server (POST, streamable HTTP). tools: tithonus_now, tithonus_stamp, tithonus_check, tithonus_lookup, tithonus_beacon
 /openapi.json        OpenAPI 3.1 spec for function calling
 discovery: /.well-known/api-catalog, /.well-known/mcp/server-card.json, /.well-known/agent-skills/index.json, /sitemap.xml, /auth.md (no account or key needed)
@@ -425,13 +427,20 @@ async function upgradeBatch(env, b) {
   }
 }
 
-// Public, signed service health, for agents deciding whether to rely on tithonus: is every stamp being batched,
-// every batch reaching the calendars, every batch reaching Bitcoin, and how long that takes. The first line carries
-// a plain verdict so summarising fetch tools keep it. Built from the stamp and batch tables (no per-request writes),
-// cached for 10 minutes. Request counts are deliberately not published: they are operator information, not trust
-// evidence, and agents did not ask to be counted in public.
+// Public, signed self-test. Instead of asserting "health ok", /stats shows four measurements, each with its
+// published limit and pass/fail, so any agent can recompute the verdict. The evidence is a canary: every hour the
+// scheduled job signs the current stats statement and stamps its sha256 through the same batch -> calendars ->
+// Bitcoin pipeline as everyone else's stamps. /canary/<hash> serves that statement; /ots/<hash> proves it in
+// Bitcoin. So the pipeline's liveness is checkable without trusting tithonus, and each canary carries the previous
+// one's hash: tithonus's own health history is chained and anchored, and cannot be rewritten later.
+// Request counts are deliberately not published: operator information, not trust evidence.
 const STATS_TTL = 600;
 const HOUR = 3600000;
+const LIMIT_CANARY = 2 * HOUR; // the hourly job ran (one missed run tolerated)
+const LIMIT_CANARY_BTC = 24 * HOUR; // the pipeline reached Bitcoin end to end
+const LIMIT_BATCH = 24 * HOUR; // no batch is left behind
+const LIMIT_STAMP = 2 * HOUR; // no stamp is left unbatched
+const CANARY_MIN_GAP = 30 * 60000; // a doubled cron run doesn't make two canaries
 
 function fmtDuration(ms) {
   const m = Math.max(0, Math.round(ms / 60000));
@@ -444,62 +453,122 @@ function median(xs) {
   return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
+// Run by the hourly job, so no manual migration is needed: adds the canary table and the batches.anchored column.
+async function ensureSchema(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS canaries (h TEXT PRIMARY KEY, t TEXT NOT NULL, body TEXT NOT NULL)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS canaries_t ON canaries(t)").run();
+  try {
+    await env.DB.prepare("SELECT anchored FROM batches LIMIT 0").all();
+  } catch (_) {
+    await env.DB.prepare("ALTER TABLE batches ADD COLUMN anchored TEXT").run();
+  }
+}
+
+// The signed lines of a stats statement at time `now`. Throws if storage is unavailable.
+async function healthLines(env, now) {
+  const one = (sql, ...a) => env.DB.prepare(sql).bind(...a).first();
+  const [waiting, oldBatch] = await Promise.all([
+    one("SELECT COUNT(*) AS n, MIN(t) AS oldest FROM stamps WHERE batch IS NULL"),
+    one("SELECT MIN(created) AS c FROM batches WHERE status IN ('unsent','pending')"),
+  ]);
+  let newest = null, inBtc = null, first = null, recent = [];
+  try {
+    [newest, inBtc, first] = await Promise.all([
+      one("SELECT h, t FROM canaries ORDER BY t DESC LIMIT 1"),
+      one("SELECT c.h AS h, c.t AS t, b.height AS height FROM canaries c JOIN stamps s ON s.h = c.h JOIN batches b ON b.id = s.batch WHERE b.status = 'complete' ORDER BY c.t DESC LIMIT 1"),
+      one("SELECT MIN(t) AS t FROM canaries"),
+    ]);
+  } catch (_) {} // no canary table until the first hourly run
+  try {
+    recent = (await env.DB.prepare("SELECT created, anchored FROM batches WHERE anchored IS NOT NULL AND anchored >= ?1").bind(iso(now - 7 * 86400000)).all()).results;
+  } catch (_) {} // not migrated until the first hourly run
+
+  const age = (t) => now - Date.parse(t);
+  const checks = [];
+  const check = (pass, text) => checks.push({ pass, text });
+  if (newest) check(age(newest.t) <= LIMIT_CANARY, `newest canary stamped ${fmtDuration(age(newest.t))} ago (limit 2h)`);
+  else check(false, `newest canary stamped: none yet, the hourly run makes the first (limit 2h)`);
+  if (inBtc) check(age(inBtc.t) <= LIMIT_CANARY_BTC, `newest canary in bitcoin stamped ${fmtDuration(age(inBtc.t))} ago, block ${inBtc.height} (limit 24h)`);
+  else if (first && first.t) check(age(first.t) <= LIMIT_CANARY_BTC, `newest canary in bitcoin: none yet, first canary stamped ${fmtDuration(age(first.t))} ago (limit 24h)`);
+  else check(false, `newest canary in bitcoin: none yet (limit 24h)`);
+  if (oldBatch && oldBatch.c) check(age(oldBatch.c) <= LIMIT_BATCH, `oldest batch not yet in bitcoin created ${fmtDuration(age(oldBatch.c))} ago (limit 24h)`);
+  else check(true, `oldest batch not yet in bitcoin: none (limit 24h)`);
+  if (waiting.n && waiting.oldest) check(age(waiting.oldest) <= LIMIT_STAMP, `oldest stamp waiting for a batch ${fmtDuration(age(waiting.oldest))} (${waiting.n} waiting; limit 2h)`);
+  else check(true, `oldest stamp waiting for a batch: none (limit 2h)`);
+
+  const passed = checks.filter((c) => c.pass).length;
+  const failing = checks.filter((c) => !c.pass).map((c) => c.text);
+  const t = iso(now);
+  const tail = failing.length ? `; failing: ${failing.join("; ")}` : inBtc ? `; newest canary in bitcoin block ${inBtc.height}` : "";
+  const delays = recent.map((x) => Date.parse(x.anchored) - Date.parse(x.created)).filter((x) => x >= 0);
+  const med = median(delays);
+  return {
+    inBtc,
+    lines: [
+      `${V} stats - signed statement: as of ${t}, tithonus.org passed ${passed} of ${checks.length} self-checks${tail}`,
+      `time ${t}`,
+      ...checks.map((c) => `${c.pass ? "pass" : "fail"} ${c.text}`),
+      `canary rule: every hour tithonus stamps sha256 of its own signed stats statement (every byte through the sig line), through the same pipeline as every stamp`,
+      `canary newest ${newest ? newest.h : "none"}`,
+      `canary in bitcoin ${inBtc ? inBtc.h : "none"}`,
+      `median time from batch to bitcoin ${med === null ? "no data yet" : `${fmtDuration(med)} (last 7 days, ${delays.length} batch${delays.length === 1 ? "" : "es"}; checked hourly)`}`,
+      `version ${VERSION}`,
+      `key ${KEY_ID}`,
+    ],
+  };
+}
+
 async function doStats(env) {
   const cache = globalThis.caches && globalThis.caches.default;
-  const key = new Request(`${ORIGIN}/__stats_cache_v2`);
+  const key = new Request(`${ORIGIN}/__stats_cache_v3`);
   if (cache) {
     const hit = await cache.match(key);
     if (hit) return result(await hit.text(), 200, `public, max-age=${STATS_TTL}`);
   }
-  const now = Date.now();
-  let batched, waiting, oldestPending, b, last, recent;
+  let h;
   try {
-    [batched, waiting, oldestPending, b, last] = await Promise.all([
-      env.DB.prepare("SELECT COALESCE(SUM(n), 0) AS n FROM batches").first(),
-      env.DB.prepare("SELECT COUNT(*) AS n, MIN(t) AS oldest FROM stamps WHERE batch IS NULL").first(),
-      env.DB.prepare("SELECT MIN(created) AS c FROM batches WHERE status IN ('unsent','pending')").first(),
-      env.DB.prepare("SELECT COUNT(*) AS n, SUM(status='complete') AS c, SUM(status='pending') AS p, SUM(status='unsent') AS u FROM batches").first(),
-      env.DB.prepare("SELECT id, height FROM batches WHERE status = 'complete' ORDER BY id DESC LIMIT 1").first(),
-    ]);
-    try {
-      recent = (await env.DB.prepare("SELECT created, anchored FROM batches WHERE anchored IS NOT NULL AND anchored >= ?1").bind(iso(now - 7 * 86400000)).all()).results;
-    } catch (_) {
-      recent = []; // not migrated yet
-    }
+    h = await healthLines(env, Date.now());
   } catch (_) {
     return errResult("busy", "storage unavailable. retry in a minute.", 503);
   }
-
-  // verdict: degraded only for conditions an agent should act on
-  const problems = [];
-  if (b.u) problems.push(`${b.u} batch${b.u > 1 ? "es" : ""} not yet accepted by any OpenTimestamps calendar`);
-  if (oldestPending && oldestPending.c && now - Date.parse(oldestPending.c) > 24 * HOUR) problems.push(`a batch has waited over 24h for Bitcoin`);
-  if (waiting.n && waiting.oldest && now - Date.parse(waiting.oldest) > 2 * HOUR) problems.push(`stamps have waited over 2h to be batched`);
-  const verdict = problems.length ? `health degraded: ${problems.join("; ")}` : "health ok";
-
-  const delays = recent.map((x) => Date.parse(x.anchored) - Date.parse(x.created)).filter((x) => x >= 0);
-  const med = median(delays);
-  const t = iso(now);
-  const lines = [
-    `${V} stats - signed statement: tithonus.org ${verdict}, as of ${t}`,
-    verdict,
-    `time ${t}`,
-    `median time from batch to bitcoin ${med === null ? "no data yet" : `${fmtDuration(med)} (last 7 days, ${delays.length} batch${delays.length === 1 ? "" : "es"}; checked hourly)`}`,
-    `stamps waiting for next hourly batch ${waiting.n}${waiting.n && waiting.oldest ? ` (oldest since ${waiting.oldest})` : ""}`,
-    `batches total ${b.n || 0} anchored ${b.c || 0} pending ${b.p || 0} unsent ${b.u || 0}`,
-    `oldest unanchored batch created ${oldestPending && oldestPending.c ? oldestPending.c : "none"}`,
-    `last anchored batch ${last ? `${last.id} bitcoin block ${last.height}` : "none"}`,
-    `stamps total ${batched.n + waiting.n}`,
-    `version ${VERSION}`,
-    `key ${KEY_ID}`,
-  ];
-  const body = (await signedBlock(env, lines)).text + "batch roots: /batches. outside copy: github.com/llamr/tithonus.org-witness\n";
+  const hints = [];
+  if (h.inBtc) hints.push(`check it: /canary/${h.inBtc.h} is that statement; /ots/${h.inBtc.h} proves it in bitcoin with any OpenTimestamps tool`);
+  hints.push("batch roots: /batches. outside copy: github.com/llamr/tithonus.org-witness");
+  const body = (await signedBlock(env, h.lines, hints)).text;
   if (cache) {
     try {
       await cache.put(key, new Response(body, { headers: { "cache-control": `public, max-age=${STATS_TTL}` } }));
     } catch (_) {}
   }
   return result(body, 200, `public, max-age=${STATS_TTL}`);
+}
+
+// Hourly: sign the current stats statement and stamp its hash like any other stamp (it joins this run's batch).
+async function makeCanary(env) {
+  const now = Date.now();
+  const last = await env.DB.prepare("SELECT t FROM canaries ORDER BY t DESC LIMIT 1").first();
+  if (last && now - Date.parse(last.t) < CANARY_MIN_GAP) return null;
+  const body = (await signedBlock(env, (await healthLines(env, now)).lines)).text;
+  const h = await sha256hex(body);
+  const t = iso(now);
+  await env.DB.prepare("INSERT INTO stamps (h, t) VALUES (?1, ?2) ON CONFLICT(h) DO NOTHING").bind(h, t).run();
+  await env.DB.prepare("INSERT INTO canaries (h, t, body) VALUES (?1, ?2, ?3) ON CONFLICT(h) DO NOTHING").bind(h, t, body).run();
+  return h;
+}
+
+// /canary (newest) or /canary/<hash>: the exact signed statement, then unsigned hints with its anchor status.
+async function doCanary(env, raw) {
+  const h = raw ? normHash(raw) : null;
+  if (h !== null && !HEX64.test(h)) return badHash(h);
+  let row = null;
+  try {
+    row = h
+      ? await env.DB.prepare("SELECT h, t, body FROM canaries WHERE h = ?1").bind(h).first()
+      : await env.DB.prepare("SELECT h, t, body FROM canaries ORDER BY t DESC LIMIT 1").first();
+  } catch (_) {} // no canary table until the first hourly run
+  if (!row) return errResult("notfound", h ? `no canary with sha256 ${h}. /canary is the newest.` : "no canary yet. the hourly run makes the first one.");
+  const hints = [`canary ${row.h}`, "rule canary = sha256(every byte above, through the sig line)", ...(await anchorLines(env, row.h))];
+  return result(row.body + hints.map((l) => l + "\n").join(""), 200, "public, max-age=300");
 }
 
 // Public, signed batch list. Lets anyone (and the outside witness) check that a stamp's batch was published
@@ -524,7 +593,10 @@ async function doBatches(env) {
 
 // The scheduled job. Safe to run any number of times: every step picks up where the last left off.
 async function anchorRun(env) {
-  const report = { retried: 0, upgraded: 0, batched: 0 };
+  const report = { retried: 0, upgraded: 0, batched: 0, canary: null };
+  try {
+    await ensureSchema(env);
+  } catch (_) {}
   for (const b of (await env.DB.prepare("SELECT id, digest FROM batches WHERE status = 'unsent' ORDER BY id LIMIT 1").all()).results) {
     report.retried += await submitBatch(env, b.id, b.digest);
   }
@@ -533,6 +605,9 @@ async function anchorRun(env) {
     await upgradeBatch(env, b);
     report.upgraded++;
   }
+  try {
+    report.canary = await makeCanary(env); // after upgrades, so it reports fresh anchoring; before batching, so it joins this batch
+  } catch (_) {}
   const waiting = await env.DB.prepare("SELECT COUNT(*) AS n FROM stamps WHERE batch IS NULL").first();
   if (!waiting || !waiting.n) return report;
   const ins = await env.DB.prepare("INSERT INTO batches (created, status) VALUES (?1, 'building')").bind(iso(Date.now())).run();
@@ -906,6 +981,7 @@ If you can connect MCP servers, https://tithonus.org/mcp (streamable HTTP) has t
 - Look up a hash: GET https://tithonus.org/v/<sha256 hex> (never creates a stamp).
 - Bitcoin proof: GET https://tithonus.org/ots/<sha256 hex> once the receipt says "anchor pending" or "anchor bitcoin block". It is a standard OpenTimestamps file; verify it with any OTS tool, no tithonus needed. For /stamp the stamped bytes are "<salt>:<text>".
 - Fair randomness: GET https://tithonus.org/beacon/<unix second> for a past round, or /beacon for the latest.
+- Is tithonus working? GET https://tithonus.org/stats: four checks, each pass or fail against a stated limit. The canary hash it names has a Bitcoin proof at /ots/<hash>.
 
 ## Reading answers
 
@@ -966,7 +1042,9 @@ const OPENAPI = JSON.stringify({
     "/beacon": op("beacon", "Latest signed randomness."),
     "/beacon/{round}": op("beaconRound", "Signed randomness for a past round.", [["round", `Unix seconds from ${GENESIS}.`]]),
     "/keys": op("keys", "Signing public keys."),
-    "/stats": op("stats", "Signed service health: a plain verdict, anchoring backlog, median time from batch to Bitcoin."),
+    "/stats": op("stats", "Signed self-test: four checks, each with measurement, limit and pass/fail, plus the canary stamp that evidences them."),
+    "/canary": op("canary", "Newest canary: tithonus's own signed stats statement, stamped hourly through the normal Bitcoin pipeline."),
+    "/canary/{sha256}": op("canaryByHash", "One canary statement. Its sha256 (bytes through the sig line) has a Bitcoin proof at /ots/{sha256}.", [["sha256", "64 hex digits."]]),
     "/batches": op("batches", "Signed list of recent anchoring batches: stamp count, Merkle root, nonce, digest, Bitcoin block."),
     "/ots/{sha256}": op("otsProof", "OpenTimestamps proof file for a stamp, anchored in Bitcoin; verifiable without tithonus.", [["sha256", "64 hex digits."]]),
   },
@@ -1011,7 +1089,7 @@ function vendor(ua) {
 
 // Only known services are recorded by name; anything else (scanner probes for .env, wp-admin, ...) is "unknown",
 // so stats stay readable and no attacker-chosen string is stored.
-const KNOWN = new Set(["manual", "llms.txt", "robots.txt", "sitemap.xml", "openapi.json", "auth.md", ".well-known", "now", "stamp", "ts", "v", "r", "beacon", "keys", "ots", "batches", "stats", "mcp"]);
+const KNOWN = new Set(["manual", "llms.txt", "robots.txt", "sitemap.xml", "openapi.json", "auth.md", ".well-known", "now", "stamp", "ts", "v", "r", "beacon", "keys", "ots", "batches", "stats", "canary", "mcp"]);
 
 function count(env, verb, req) {
   if (!env.STATS) return;
@@ -1064,6 +1142,8 @@ async function route(req, env, url) {
       return doStats(env);
     case "batches":
       return doBatches(env);
+    case "canary":
+      return doCanary(env, rest ? decodeSafe(rest) : null);
     case "ots": {
       const h = normHash(decodeSafe(rest).replace(/\.ots$/, ""));
       if (!HEX64.test(h)) return badHash(h);
