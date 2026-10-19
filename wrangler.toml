@@ -1,0 +1,27 @@
+name = "tithonus"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+workers_dev = true
+
+# Serve directly on the domain (no redirects; some agent fetch tools won't follow them).
+routes = [
+  { pattern = "tithonus.org", custom_domain = true },
+  { pattern = "www.tithonus.org", custom_domain = true }
+]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "tithonus"
+database_id = "cd30cfec-06be-4841-b205-25916ecc3ca6"
+
+# Aggregate stats (day, verb, vendor). Fire-and-forget, no latency.
+# If your account doesn't have Analytics Engine, delete these 3 lines; the Worker runs fine without it.
+
+# SIGNING_KEY is a secret: `npx wrangler secret put SIGNING_KEY` (never put it in this file).
+
+[[analytics_engine_datasets]]
+binding = "STATS"
+dataset = "tithonus"
+
+[triggers]
+crons = ["7 * * * *"]
