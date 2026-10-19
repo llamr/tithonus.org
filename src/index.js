@@ -6,7 +6,7 @@
 // POST /mcp is a zero-dependency MCP server (streamable HTTP, stateless, JSON responses).
 
 const V = "tithonus2";
-const VERSION = "3.2.1";
+const VERSION = "3.3.0";
 const KEY_ID = "1";
 const ORIGIN = "https://tithonus.org";
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -29,7 +29,7 @@ url length: some fetch tools refuse urls over ~255 chars. keep /stamp text under
 /keys                signing keys
 /ots/<sha256hex>      OpenTimestamps proof for a stamp, anchored in Bitcoin in hourly batches. any OTS tool verifies it without tithonus.
 /batches             signed list of recent batches: count, merkle root, nonce, submitted digest, bitcoin block. copied hourly by an outside witness.
-/stats               signed service health: stamps, batches, anchoring backlog, stamps per day; plus request counts by service. refreshed every 10 minutes.
+/stats               signed health for agents: verdict first, anchoring backlog, median time to bitcoin. refreshed every 10 minutes.
 /mcp                 MCP server (POST, streamable HTTP). tools: tithonus_now, tithonus_stamp, tithonus_check, tithonus_lookup, tithonus_beacon
 /openapi.json        OpenAPI 3.1 spec for function calling
 discovery: /.well-known/api-catalog, /.well-known/mcp/server-card.json, /.well-known/agent-skills/index.json, /sitemap.xml, /auth.md (no account or key needed)
@@ -413,76 +413,87 @@ async function upgradeBatch(env, b) {
       }
     }
   }
-  await env.DB.prepare("UPDATE batches SET cals = ?1, status = ?2, height = ?3 WHERE id = ?4")
-    .bind(JSON.stringify(cals), height === null ? "pending" : "complete", height, b.id)
-    .run();
+  const status = height === null ? "pending" : "complete";
+  try {
+    // anchored = when this job first saw the batch in a Bitcoin block (hourly checks, so accurate to about an hour)
+    await env.DB.prepare("UPDATE batches SET cals = ?1, status = ?2, height = ?3, anchored = CASE WHEN ?2 = 'complete' AND anchored IS NULL THEN ?5 ELSE anchored END WHERE id = ?4")
+      .bind(JSON.stringify(cals), status, height, b.id, iso(Date.now()))
+      .run();
+  } catch (_) {
+    // database not yet migrated (no anchored column): keep anchoring working, just without the timestamp
+    await env.DB.prepare("UPDATE batches SET cals = ?1, status = ?2, height = ?3 WHERE id = ?4").bind(JSON.stringify(cals), status, height, b.id).run();
+  }
 }
 
-// Public, signed batch list. Lets anyone (and the outside witness) check that a stamp's batch was published
-// and that published roots never change afterwards. Last 7 days of batches, plus any still pending.
-// Public, signed service health. Everything an agent needs to judge whether the notary is keeping its promises:
-// every stamp batched, every batch sent, every batch anchored, nothing waiting too long. Built from the stamp and
-// batch tables (no per-request writes, so no added latency), cached for 10 minutes.
-// Request counts are added below the signature if the operator has given the Worker a read-only analytics token
-// (secrets STATS_ACCOUNT and STATS_TOKEN). They are the same coarse counts the homepage promises: service and vendor only.
+// Public, signed service health, for agents deciding whether to rely on tithonus: is every stamp being batched,
+// every batch reaching the calendars, every batch reaching Bitcoin, and how long that takes. The first line carries
+// a plain verdict so summarising fetch tools keep it. Built from the stamp and batch tables (no per-request writes),
+// cached for 10 minutes. Request counts are deliberately not published: they are operator information, not trust
+// evidence, and agents did not ask to be counted in public.
 const STATS_TTL = 600;
+const HOUR = 3600000;
 
-async function trafficLines(env) {
-  if (!env.STATS_ACCOUNT || !env.STATS_TOKEN) return [];
-  try {
-    const sql = "SELECT blob1 AS service, blob2 AS vendor, SUM(_sample_interval) AS n FROM tithonus WHERE timestamp > NOW() - INTERVAL '1' DAY GROUP BY service, vendor ORDER BY n DESC LIMIT 25";
-    const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${env.STATS_ACCOUNT}/analytics_engine/sql`, {
-      method: "POST",
-      headers: { authorization: `Bearer ${env.STATS_TOKEN}` },
-      body: sql,
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!r.ok) return [];
-    const rows = (await r.json()).data || [];
-    return ["requests last 24h by service and vendor (unsigned; 'unknown' = scanners probing paths tithonus does not have):",
-      ...rows.map((x) => `traffic ${x.service} ${x.vendor} ${x.n}`)];
-  } catch (_) {
-    return [];
-  }
+function fmtDuration(ms) {
+  const m = Math.max(0, Math.round(ms / 60000));
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
+}
+
+function median(xs) {
+  if (!xs.length) return null;
+  const s = [...xs].sort((a, b) => a - b), mid = s.length >> 1;
+  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
 async function doStats(env) {
   const cache = globalThis.caches && globalThis.caches.default;
-  const key = new Request(`${ORIGIN}/__stats_cache_v1`);
+  const key = new Request(`${ORIGIN}/__stats_cache_v2`);
   if (cache) {
     const hit = await cache.match(key);
     if (hit) return result(await hit.text(), 200, `public, max-age=${STATS_TTL}`);
   }
-  let total, waiting, oldest, b, last, days;
+  const now = Date.now();
+  let batched, waiting, oldestPending, b, last, recent;
   try {
-    const since = iso(Date.now() - 14 * 86400000);
-    [total, waiting, oldest, b, last, days] = await Promise.all([
-      env.DB.prepare("SELECT COALESCE(SUM(n), 0) AS n FROM batches").first(), // stamps already batched; plus waiting = total
-      env.DB.prepare("SELECT COUNT(*) AS n FROM stamps WHERE batch IS NULL").first(),
-      env.DB.prepare("SELECT MIN(b.created) AS c FROM batches b WHERE b.status IN ('unsent','pending')").first(),
+    [batched, waiting, oldestPending, b, last] = await Promise.all([
+      env.DB.prepare("SELECT COALESCE(SUM(n), 0) AS n FROM batches").first(),
+      env.DB.prepare("SELECT COUNT(*) AS n, MIN(t) AS oldest FROM stamps WHERE batch IS NULL").first(),
+      env.DB.prepare("SELECT MIN(created) AS c FROM batches WHERE status IN ('unsent','pending')").first(),
       env.DB.prepare("SELECT COUNT(*) AS n, SUM(status='complete') AS c, SUM(status='pending') AS p, SUM(status='unsent') AS u FROM batches").first(),
       env.DB.prepare("SELECT id, height FROM batches WHERE status = 'complete' ORDER BY id DESC LIMIT 1").first(),
-      env.DB.prepare("SELECT substr(t, 1, 10) AS d, COUNT(*) AS n FROM stamps WHERE t >= ?1 GROUP BY d ORDER BY d").bind(since).all(),
     ]);
+    try {
+      recent = (await env.DB.prepare("SELECT created, anchored FROM batches WHERE anchored IS NOT NULL AND anchored >= ?1").bind(iso(now - 7 * 86400000)).all()).results;
+    } catch (_) {
+      recent = []; // not migrated yet
+    }
   } catch (_) {
     return errResult("busy", "storage unavailable. retry in a minute.", 503);
   }
-  const t = iso(Date.now());
+
+  // verdict: degraded only for conditions an agent should act on
+  const problems = [];
+  if (b.u) problems.push(`${b.u} batch${b.u > 1 ? "es" : ""} not yet accepted by any OpenTimestamps calendar`);
+  if (oldestPending && oldestPending.c && now - Date.parse(oldestPending.c) > 24 * HOUR) problems.push(`a batch has waited over 24h for Bitcoin`);
+  if (waiting.n && waiting.oldest && now - Date.parse(waiting.oldest) > 2 * HOUR) problems.push(`stamps have waited over 2h to be batched`);
+  const verdict = problems.length ? `health degraded: ${problems.join("; ")}` : "health ok";
+
+  const delays = recent.map((x) => Date.parse(x.anchored) - Date.parse(x.created)).filter((x) => x >= 0);
+  const med = median(delays);
+  const t = iso(now);
   const lines = [
-    `${V} stats - signed statement: service health at tithonus.org as of ${t}`,
+    `${V} stats - signed statement: tithonus.org ${verdict}, as of ${t}`,
+    verdict,
     `time ${t}`,
-    `stamps total ${total.n + waiting.n}`,
-    `stamps waiting for next hourly batch ${waiting.n}`,
+    `median time from batch to bitcoin ${med === null ? "no data yet" : `${fmtDuration(med)} (last 7 days, ${delays.length} batch${delays.length === 1 ? "" : "es"}; checked hourly)`}`,
+    `stamps waiting for next hourly batch ${waiting.n}${waiting.n && waiting.oldest ? ` (oldest since ${waiting.oldest})` : ""}`,
     `batches total ${b.n || 0} anchored ${b.c || 0} pending ${b.p || 0} unsent ${b.u || 0}`,
-    `oldest unanchored batch created ${oldest && oldest.c ? oldest.c : "none"}`,
+    `oldest unanchored batch created ${oldestPending && oldestPending.c ? oldestPending.c : "none"}`,
     `last anchored batch ${last ? `${last.id} bitcoin block ${last.height}` : "none"}`,
-    ...days.results.map((x) => `stamps on ${x.d} ${x.n}`),
+    `stamps total ${batched.n + waiting.n}`,
     `version ${VERSION}`,
     `key ${KEY_ID}`,
   ];
-  const signed = (await signedBlock(env, lines)).text;
-  const traffic = await trafficLines(env);
-  const body = signed + traffic.map((l) => l + "\n").join("") + "batch roots: /batches. outside copy: github.com/llamr/tithonus.org-witness\n";
+  const body = (await signedBlock(env, lines)).text + "batch roots: /batches. outside copy: github.com/llamr/tithonus.org-witness\n";
   if (cache) {
     try {
       await cache.put(key, new Response(body, { headers: { "cache-control": `public, max-age=${STATS_TTL}` } }));
@@ -491,6 +502,8 @@ async function doStats(env) {
   return result(body, 200, `public, max-age=${STATS_TTL}`);
 }
 
+// Public, signed batch list. Lets anyone (and the outside witness) check that a stamp's batch was published
+// and that published roots never change afterwards. Last 7 days of batches, plus any still pending.
 async function doBatches(env) {
   let rows;
   try {
@@ -953,7 +966,7 @@ const OPENAPI = JSON.stringify({
     "/beacon": op("beacon", "Latest signed randomness."),
     "/beacon/{round}": op("beaconRound", "Signed randomness for a past round.", [["round", `Unix seconds from ${GENESIS}.`]]),
     "/keys": op("keys", "Signing public keys."),
-    "/stats": op("stats", "Signed service health: stamp totals, batch and anchoring status, stamps per day, request counts by service."),
+    "/stats": op("stats", "Signed service health: a plain verdict, anchoring backlog, median time from batch to Bitcoin."),
     "/batches": op("batches", "Signed list of recent anchoring batches: stamp count, Merkle root, nonce, digest, Bitcoin block."),
     "/ots/{sha256}": op("otsProof", "OpenTimestamps proof file for a stamp, anchored in Bitcoin; verifiable without tithonus.", [["sha256", "64 hex digits."]]),
   },
