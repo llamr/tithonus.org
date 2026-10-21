@@ -6,7 +6,7 @@
 // POST /mcp is a zero-dependency MCP server (streamable HTTP, stateless, JSON responses).
 
 const V = "tithonus2";
-const VERSION = "3.4.0";
+const VERSION = "3.5.0";
 const KEY_ID = "1";
 const ORIGIN = "https://tithonus.org";
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -16,7 +16,7 @@ const MAX_TEXT_URL = 2000; // /stamp/<text> over GET
 const MAX_TEXT_MCP = 100000; // tithonus_stamp over MCP
 
 const MANUAL = `tithonus.org  time + proof for agents. plain text. every feature is one GET on a path; no query strings needed.
-/now                 signed current time
+/now                 signed current time, with the latest drand round in it: provably made after that round.
 /now/<anything>      same, with your nonce signed. a fresh nonce beats fetch caches.
 /stamp/<text>        notarise text (percent-encode it). server salts + hashes it; text is never stored or logged. returns a receipt link.
 /ts/<sha256hex>      notarise a hash you made yourself. repeats return the first receipt.
@@ -24,10 +24,10 @@ const MANUAL = `tithonus.org  time + proof for agents. plain text. every feature
 /r/<receipt>         check a receipt link. append /<text> to also check it matches your text.
                      receipts come as "link" (short, checked against the store) and "proof" (long, verifies offline).
 url length: some fetch tools refuse urls over ~255 chars. keep /stamp text under ~150 chars and /r checks under ~180. longer: /mcp, or hash it yourself and use /ts.
-/beacon              latest randomness (round = unix second)
-/beacon/<round>      randomness for a past round (from 1791244800)
+/beacon              latest public randomness from drand (League of Entropy). tithonus relays it; nobody can predict or choose it.
+/beacon/<round>      one drand quicknet round (one every 3 s). its "token" line goes in text you stamp.
 /keys                signing keys
-/ots/<sha256hex>      OpenTimestamps proof for a stamp, anchored in Bitcoin in hourly batches. any OTS tool verifies it without tithonus.
+/ots/<sha256hex>     OpenTimestamps proof for a stamp, anchored in Bitcoin in hourly batches. any OTS tool verifies it without tithonus. save it once anchored: it outlives tithonus.
 /batches             signed list of recent batches: count, merkle root, nonce, submitted digest, bitcoin block. copied hourly by an outside witness.
 /stats               signed self-test: 4 checks, each with its measurement, limit and pass/fail. refreshed every 10 minutes.
 /canary              every hour tithonus stamps its own signed stats statement like any stamp. this is the newest.
@@ -37,9 +37,12 @@ url length: some fetch tools refuse urls over ~255 chars. keep /stamp text under
 discovery: /.well-known/api-catalog, /.well-known/mcp/server-card.json, /.well-known/agent-skills/index.json, /sitemap.xml, /auth.md (no account or key needed)
 stale answer? fetch tools cache by url for hours. put /~<anything>/ in front of any path for a fresh one: /~a7/beacon, /~a7/v/<hash>
 verify: sig is ed25519 base64url over the exact bytes before the "sig " line (utf-8, \\n endings). lines after sig are unsigned hints.
-beacon: x = sha256(seed bytes); seed = ed25519 sig over "tithonus1 beacon <round>". the operator can compute future rounds.
+beacon: x = drand randomness = sha256(drand bls signature); verify with drand's public key, no tithonus needed. unix-second rounds 1791244800 to 1796083200 are the retired key-based beacon: still checkable, but the operator could compute them.
+not before: put a /beacon token (drand-<round>-<hex>) in your text, then stamp it. the receipt then bounds it both ways: written after the drand round, existed by the stamp time.
 stamp: hash = sha256("<salt>:<text>"). a receipt link carrying the salt lets anyone who has the text check it.
 "no" answers are 200 with an err line. trust: one operator key until a stamp is anchored in Bitcoin (hourly, then minutes to hours); after that, nobody. no stamp is ever deleted.
+key leak: if key 1 ever leaks, /keys will say so. stamps anchored in bitcoin before then stay proven; unanchored receipts and /now statements from that key prove nothing. the key itself is anchored hourly in /stats canaries.
+security reports: /.well-known/security.txt
 logs: day, verb, vendor. no ip, no hash, no content.
 `;
 
@@ -50,6 +53,14 @@ Content-Signal: search=yes, ai-input=yes, ai-train=yes
 Allow: /
 
 Sitemap: ${"https://tithonus.org"}/sitemap.xml
+`;
+
+// RFC 9116. Reports go to GitHub private vulnerability reporting on the code repository. Renew Expires yearly.
+const SECURITY_TXT = `Contact: https://github.com/llamr/tithonus.org/security/advisories/new
+Expires: 2027-10-24T00:00:00Z
+Preferred-Languages: en
+Canonical: https://tithonus.org/.well-known/security.txt
+Policy: https://github.com/llamr/tithonus.org
 `;
 
 // Discovery files. Static, cheap, standard.
@@ -213,6 +224,7 @@ const OTS_MAGIC = new Uint8Array([
 const ATT_PENDING = "83dfe30d2ef90c8e";
 const ATT_BITCOIN = "0588960d73d71901";
 const OP_SHA256 = 0x08, OP_APPEND = 0xf0, OP_PREPEND = 0xf1;
+const MAX_BATCH = 1000; // keeps each hourly run, and each /ots rebuild, well inside a free-plan CPU budget
 const UPGRADE_BATCHES_PER_RUN = 12; // 12 x 3 calendars + a new batch stays under the free plan's 50 subrequests
 
 const toHex = (b) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -467,6 +479,7 @@ async function ensureSchema(env) {
 // The signed lines of a stats statement at time `now`. Throws if storage is unavailable.
 async function healthLines(env, now) {
   const one = (sql, ...a) => env.DB.prepare(sql).bind(...a).first();
+  const { x: pub } = await getKey(env);
   const [waiting, oldBatch] = await Promise.all([
     one("SELECT COUNT(*) AS n, MIN(t) AS oldest FROM stamps WHERE batch IS NULL"),
     one("SELECT MIN(created) AS c FROM batches WHERE status IN ('unsent','pending')"),
@@ -512,6 +525,7 @@ async function healthLines(env, now) {
       `canary newest ${newest ? newest.h : "none"}`,
       `canary in bitcoin ${inBtc ? inBtc.h : "none"}`,
       `median time from batch to bitcoin ${med === null ? "no data yet" : `${fmtDuration(med)} (last 7 days, ${delays.length} batch${delays.length === 1 ? "" : "es"}; checked hourly)`}`,
+      `public key ${KEY_ID} ed25519 ${pub} (each canary anchors it in bitcoin)`,
       `version ${VERSION}`,
       `key ${KEY_ID}`,
     ],
@@ -612,7 +626,11 @@ async function anchorRun(env) {
   if (!waiting || !waiting.n) return report;
   const ins = await env.DB.prepare("INSERT INTO batches (created, status) VALUES (?1, 'building')").bind(iso(Date.now())).run();
   const id = ins.meta.last_row_id;
-  await env.DB.prepare("UPDATE stamps SET batch = ?1 WHERE batch IS NULL").bind(id).run();
+  // at most MAX_BATCH stamps per hour, oldest first but the canary always in, so a flood can't stall the job.
+  // anything left over joins the next run, and /stats shows it waiting.
+  await env.DB.prepare("UPDATE stamps SET batch = ?1 WHERE h IN (SELECT h FROM stamps WHERE batch IS NULL ORDER BY (h = ?2) DESC, t LIMIT ?3)")
+    .bind(id, report.canary || "", MAX_BATCH)
+    .run();
   const hs = (await env.DB.prepare("SELECT h FROM stamps WHERE batch = ?1 ORDER BY h").bind(id).all()).results.map((r) => r.h);
   const levels = await merkleLevels(hs.map(fromHex));
   const root = levels[levels.length - 1][0];
@@ -632,8 +650,8 @@ async function anchorLines(env, h) {
     const r = await env.DB.prepare("SELECT s.batch AS batch, b.status AS status, b.height AS height FROM stamps s LEFT JOIN batches b ON b.id = s.batch WHERE s.h = ?1").bind(h).first();
     if (!r) return [];
     if (r.batch === null || r.batch === undefined) return ["anchor queued: joins the next hourly batch, then Bitcoin via OpenTimestamps"];
-    if (r.status === "complete") return [`anchor bitcoin block ${r.height}: checkable without tithonus`, `ots ${ORIGIN}/ots/${h}`];
-    return [`anchor pending: batch ${r.batch} sent to OpenTimestamps; Bitcoin confirmation usually within hours`, `ots ${ORIGIN}/ots/${h}`];
+    if (r.status === "complete") return [`anchor bitcoin block ${r.height}: checkable without tithonus`, `ots ${ORIGIN}/ots/${h}`, "save that .ots file: it is your permanent proof and needs nothing from tithonus"];
+    return [`anchor pending: batch ${r.batch} sent to OpenTimestamps; Bitcoin confirmation usually within hours`, `ots ${ORIGIN}/ots/${h}`, "once anchored, save that .ots file: it is your permanent proof and outlives tithonus"];
   } catch (_) {
     return [];
   }
@@ -670,6 +688,65 @@ async function otsFileFor(env, h) {
   return { file, complete: r.status === "complete" };
 }
 
+// ---------- drand: public randomness from the League of Entropy (quicknet) ----------
+// Each round's randomness is sha256 of a BLS threshold signature made jointly by independent organisations every 3 s.
+// Nobody, tithonus included, can predict or choose it, and anyone can verify it against drand's public key.
+// tithonus uses it twice: /beacon relays it (replacing the old key-based beacon), and a drand "token" inside stamped
+// text proves the text was written after that round, so a receipt bounds it both ways.
+const DRAND = {
+  chain: "52db9ba70e0cc0f6eaf7803dd07447a1f5477735fd3f661792ba94600c84e971",
+  genesis: 1692803367,
+  period: 3,
+  scheme: "bls-unchained-g1-rfc9380",
+  publicKey: "83cf0f2896adee7eb8b5f01fcad3912212c437e0073e911fb90022d3e760183c8c4b450b6a0a6c3ac6a5776a2d1064510d1fec758c921cc22b0e17e63aaf4bcb5ed66304de9cf809bd274ca73bab4af5a6e9c76a4bc09e76eae8991ef5ece45a",
+};
+const DRAND_RELAYS = ["https://drand.cloudflare.com", "https://api.drand.sh", "https://api2.drand.sh"];
+const LEGACY_BEACON_END = 1796083200; // 2026-12-01T00:00:00Z: the old key-based beacon is served for rounds up to here, never after
+const DRAND_TOKEN = /\bdrand-([0-9]{1,12})-([0-9a-f]{16,64})\b/;
+const drandRoundAt = (unix) => Math.floor((unix - DRAND.genesis) / DRAND.period) + 1;
+const drandTime = (round) => DRAND.genesis + (round - 1) * DRAND.period;
+const drandToken = (b) => `drand-${b.round}-${b.randomness.slice(0, 16)}`;
+
+// One round from the first relay that answers with a self-consistent beacon (randomness = sha256(signature)).
+// Past rounds never change, so the edge caches them for a year. The BLS signature itself is left to the reader to
+// verify against DRAND.publicKey: tithonus is a relay here, not the source of trust.
+async function drandFetch(round) {
+  for (const base of DRAND_RELAYS) {
+    try {
+      const res = await fetch(`${base}/${DRAND.chain}/public/${round}`, {
+        headers: { accept: "application/json" },
+        cf: { cacheTtlByStatus: { "200-299": 31536000, "300-599": 0 } },
+        signal: AbortSignal.timeout(1500),
+      });
+      if (res.status !== 200) continue;
+      const j = await res.json();
+      if (j.round !== round || !/^[0-9a-f]{64}$/.test(j.randomness) || !/^[0-9a-f]{96}$/.test(j.signature)) continue;
+      if ((await sha256hex(fromHex(j.signature))) !== j.randomness) continue;
+      return { round, randomness: j.randomness, signature: j.signature };
+    } catch (_) {}
+  }
+  return null;
+}
+
+// The newest round that is surely published (one period of slack for clock skew).
+async function drandLatest() {
+  const r = drandRoundAt(Math.floor(Date.now() / 1000)) - 1;
+  return (await drandFetch(r)) || (await drandFetch(r - 1));
+}
+
+// If text carries a drand token, check it: a match proves the text was written after that round.
+async function drandAfter(text) {
+  const m = DRAND_TOKEN.exec(text || "");
+  if (!m) return null;
+  const round = Number(m[1]);
+  if (round < 1 || drandTime(round) > Date.now() / 1000) return { ok: false, line: `drand token: round ${round} is not published yet, so it proves nothing` };
+  const b = await drandFetch(round);
+  if (!b) return { ok: false, line: `drand token: round ${round} could not be fetched just now; check it at api.drand.sh/${DRAND.chain}/public/${round}` };
+  if (!b.randomness.startsWith(m[2])) return { ok: false, line: `drand token does not match round ${round}: no "written after" proof` };
+  const at = iso(drandTime(round) * 1000);
+  return { ok: true, at, line: `written after ${at}: the text carries drand round ${round}, which nobody could know before then` };
+}
+
 // ---------- core actions (shared by HTTP and MCP) ----------
 
 async function doNow(env, rawNonce) {
@@ -678,13 +755,18 @@ async function doNow(env, rawNonce) {
   if (rawNonce !== undefined && rawNonce !== null && rawNonce !== "") {
     nonce = NONCE.test(rawNonce) ? rawNonce : "sha256:" + (await sha256hex(String(rawNonce)));
   }
+  const b = await drandLatest();
   const lines = [`${V} now - signed statement: the time at tithonus.org was ${t}`, `time ${t}`];
   if (nonce) lines.push(`nonce ${nonce}`);
+  if (b) lines.push(`after drand round ${b.round} at ${iso(drandTime(b.round) * 1000)} randomness ${b.randomness}`);
   lines.push(`key ${KEY_ID}`);
-  return result((await signedBlock(env, lines)).text);
+  const hints = b
+    ? [`rule: time is at or after the drand round's time. nobody knew that randomness earlier, so this statement was made after it.`, `token ${drandToken(b)}`]
+    : ["drand unreachable just now: this statement has no outside lower bound"];
+  return result((await signedBlock(env, lines, hints)).text);
 }
 
-async function stampHash(env, h, salt) {
+async function stampHash(env, h, salt, extra = []) {
   const t = iso(Date.now());
   let isNew = false;
   let first = t;
@@ -699,7 +781,7 @@ async function stampHash(env, h, salt) {
   const hints = [];
   if (salt) hints.push(`salt ${salt}`, `rule hash = sha256("<salt>:<text>")`);
   hints.push(isNew ? "new 1 (first stamp of this hash)" : `new 0 (already stamped at ${first}; this is that receipt)`);
-  hints.push(...receiptHints(h, first, sig, salt), ...(await anchorLines(env, h)));
+  hints.push(...extra, ...receiptHints(h, first, sig, salt), ...(await anchorLines(env, h)));
   return result(text + hints.map((l) => l + "\n").join(""));
 }
 
@@ -714,7 +796,8 @@ async function doStampText(env, text, max) {
   if (text.length > max) return errResult("toolong", `text is ${text.length} chars, max ${max} here. hash it yourself and use /ts/<sha256hex>.`);
   const salt = randomHex(8); // 64 bits: enough to stop guessing, short enough for urls
   const h = await sha256hex(`${salt}:${text}`);
-  return stampHash(env, h, salt);
+  const after = await drandAfter(text);
+  return stampHash(env, h, salt, after ? [after.line] : []);
 }
 
 async function doLookup(env, raw) {
@@ -790,23 +873,59 @@ async function doCheck(env, token, text) {
     ? `match: your text existed by ${t}. it is exactly what this receipt covers.`
     : `no match: your text is NOT what this receipt covers. this receipt proves nothing about your text.`;
   const anchor = await anchorLines(env, h);
-  return result(`${verdict}\n${receipt}\n` + anchor.map((l) => l + "\n").join(""), 200, anchor.length ? "public, max-age=300" : "public, max-age=86400");
+  const extra = [];
+  if (matched) {
+    const after = await drandAfter(text);
+    if (after) {
+      extra.push(after.line);
+      if (after.ok && Date.parse(after.at) > Date.parse(t)) extra.push("warning: the receipt time is earlier than the drand round, which is impossible. do not trust this receipt.");
+    }
+  }
+  return result(`${verdict}\n${receipt}\n` + [...extra, ...anchor].map((l) => l + "\n").join(""), 200, anchor.length || extra.length ? "public, max-age=300" : "public, max-age=86400");
 }
 
 async function doBeacon(env, roundRaw) {
-  const cur = Math.floor(Date.now() / 1000);
-  let r = cur;
+  const nowS = Math.floor(Date.now() / 1000);
   const specific = roundRaw !== undefined && roundRaw !== null && roundRaw !== "";
+  let r;
   if (specific) {
     const s = String(roundRaw).trim();
-    if (!/^[0-9]{1,12}$/.test(s)) return errResult("badinput", "round is unix seconds, digits only. /beacon for the latest.");
+    if (!/^[0-9]{1,12}$/.test(s)) return errResult("badinput", "round is a drand quicknet round number, digits only. /beacon for the latest.");
     r = Number(s);
-    if (r < GENESIS) return errResult("beforegenesis", `first round is ${GENESIS} (${iso(GENESIS * 1000)}).`);
-    if (r > cur) return errResult("future", `round ${r} is available at ${iso(r * 1000)}, in ${r - cur}s. ask again then.`);
+    if (r >= GENESIS) return legacyBeacon(env, r, nowS);
+    if (r < 1) return errResult("badinput", "drand rounds start at 1. /beacon for the latest.");
+    if (r >= drandRoundAt(nowS)) {
+      const at = drandTime(r);
+      return errResult("future", `drand round ${r} is published at ${iso(at * 1000)}, in about ${Math.max(1, at - nowS + DRAND.period)}s. ask again then.`);
+    }
   }
+  const b = specific ? await drandFetch(r) : await drandLatest();
+  if (!b) return errResult("busy", "drand relays unreachable just now. retry in a minute.", 503);
+  const t = iso(drandTime(b.round) * 1000);
+  const lines = [
+    `${V} beacon - signed statement: drand quicknet round ${b.round} (${t}) randomness is ${b.randomness}`,
+    `round ${b.round}`,
+    `time ${t}`,
+    `x ${b.randomness}`,
+    `drand signature ${b.signature}`,
+    `drand chain ${DRAND.chain}`,
+    `key ${KEY_ID}`,
+  ];
+  const hints = [
+    `token ${drandToken(b)}`,
+    `use: put the token in text before you stamp it. the receipt then proves the text was written after ${t}.`,
+    `source: drand quicknet (League of Entropy). x = sha256(drand signature). verify the signature with drand's public key at https://api.drand.sh/${DRAND.chain}/info; tithonus cannot predict or choose it.`,
+  ];
+  return result((await signedBlock(env, lines, hints)).text, 200, specific ? "public, max-age=86400" : "no-store");
+}
+
+// The retired key-based beacon (rounds are unix seconds). Served unchanged for rounds it already covered, so old
+// draws stay checkable; it never issues rounds after LEGACY_BEACON_END.
+async function legacyBeacon(env, r, nowS) {
+  if (r > LEGACY_BEACON_END) return errResult("retired", `the key-based beacon ended at ${iso(LEGACY_BEACON_END * 1000)}. /beacon gives drand randomness, which nobody can predict.`);
+  if (r > nowS) return errResult("future", `round ${r} is available at ${iso(r * 1000)}, in ${r - nowS}s. ask again then.`);
   const t = iso(r * 1000);
-  // seed keeps v1 continuity: same per-round value as before. x = sha256(seed).
-  const seed = await signRaw(env, `tithonus1 beacon ${r}`);
+  const seed = await signRaw(env, `tithonus1 beacon ${r}`); // v1 continuity: same per-round value as before
   const x = await sha256hex(seed);
   const lines = [
     `${V} beacon - signed statement: randomness for round ${r} (${t}) is ${x}`,
@@ -816,12 +935,13 @@ async function doBeacon(env, roundRaw) {
     `seed ${b64url(seed)}`,
     `key ${KEY_ID}`,
   ];
-  return result((await signedBlock(env, lines)).text, 200, specific ? "public, max-age=86400" : "no-store");
+  const hints = ["legacy: x = sha256(seed); seed = ed25519 sig over \"tithonus1 beacon <round>\". the operator could compute any round. new draws: /beacon (drand)."];
+  return result((await signedBlock(env, lines, hints)).text, 200, "public, max-age=86400");
 }
 
 async function doKeys(env) {
   const { x } = await getKey(env);
-  return result(`ok keys\nkey ${KEY_ID} ed25519 ${x}\n`, 200, "public, max-age=3600");
+  return result(`ok keys\nkey ${KEY_ID} ed25519 ${x}\nrevoked none\n`, 200, "public, max-age=3600");
 }
 
 function decodeSafe(s) {
@@ -839,7 +959,7 @@ const MCP_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const TOOLS = [
   {
     name: "tithonus_now",
-    description: "Get a signed statement of the current UTC time from tithonus.org. Use when you need trustworthy current time, or proof of when you asked. Pass a fresh nonce to bind the answer to your request.",
+    description: "Get a signed statement of the current UTC time from tithonus.org. It includes the latest drand round, so anyone can see it was made after that moment. Use when you need trustworthy current time, or proof of when you asked. Pass a fresh nonce to bind the answer to your request.",
     inputSchema: { type: "object", properties: { nonce: { type: "string", description: "Optional. Any string; long or unusual ones are signed as their sha256." } } },
     annotations: { title: "Signed current time", readOnlyHint: true, openWorldHint: false },
     run: (env, a) => doNow(env, a.nonce),
@@ -880,8 +1000,8 @@ const TOOLS = [
   },
   {
     name: "tithonus_beacon",
-    description: "Get signed public randomness for a round (a unix second). Use for fair coin flips, lotteries or tie-breaks other agents can recheck. Omit round for the latest. Trust note: the operator can compute future rounds.",
-    inputSchema: { type: "object", properties: { round: { type: "integer", description: `Optional. Unix seconds, from ${GENESIS} up to now.` } } },
+    description: "Get public randomness from drand (League of Entropy), relayed and signed by tithonus. Nobody, tithonus included, can predict or choose it. Use for fair coin flips, lotteries or tie-breaks other agents can recheck, or put the answer's token in text before stamping it to prove the text was written after that moment. Omit round for the latest.",
+    inputSchema: { type: "object", properties: { round: { type: "integer", description: "Optional. drand quicknet round number (one every 3 seconds)." } } },
     annotations: { title: "Randomness beacon", readOnlyHint: true, openWorldHint: false },
     run: (env, a) => doBeacon(env, a.round),
   },
@@ -980,7 +1100,9 @@ If you can connect MCP servers, https://tithonus.org/mcp (streamable HTTP) has t
 - Notarise data you hashed yourself: GET https://tithonus.org/ts/<sha256 hex>. Salt guessable content first.
 - Look up a hash: GET https://tithonus.org/v/<sha256 hex> (never creates a stamp).
 - Bitcoin proof: GET https://tithonus.org/ots/<sha256 hex> once the receipt says "anchor pending" or "anchor bitcoin block". It is a standard OpenTimestamps file; verify it with any OTS tool, no tithonus needed. For /stamp the stamped bytes are "<salt>:<text>".
-- Fair randomness: GET https://tithonus.org/beacon/<unix second> for a past round, or /beacon for the latest.
+- Fair randomness: GET https://tithonus.org/beacon for the latest drand round, or /beacon/<round> for a past one. Nobody can predict or choose it.
+- Prove something was written after a moment: put the "token" line from /beacon (drand-<round>-<hex>) in your text, then stamp it. Checking the receipt with the text reports "written after <time>".
+- Keep your proof: once a receipt says "anchor bitcoin block", save the .ots file from /ots/<hash>. It needs nothing from tithonus.
 - Is tithonus working? GET https://tithonus.org/stats: four checks, each pass or fail against a stated limit. The canary hash it names has a Bitcoin proof at /ots/<hash>.
 
 ## Reading answers
@@ -994,7 +1116,7 @@ If you can connect MCP servers, https://tithonus.org/mcp (streamable HTTP) has t
 - Fetch tools cache by URL for hours. For a fresh answer put /~<anything>/ before the path: /~a7/beacon.
 - Some fetch tools refuse URLs over ~255 characters. Keep /stamp text under ~150 characters, or use MCP.
 - Query strings are optional everywhere; some tools drop them, so nothing depends on them.
-- Trust: the operator key alone until a stamp is anchored in Bitcoin (hourly batches, then minutes to hours). After that the .ots proof needs nobody. The operator can compute future beacon rounds.
+- Trust: the operator key alone until a stamp is anchored in Bitcoin (hourly batches, then minutes to hours). After that the .ots proof needs nobody. Beacon randomness comes from drand, not the operator.
 `;
 
 let skillsIndexCache = null;
@@ -1032,15 +1154,15 @@ const OPENAPI = JSON.stringify({
   info: { title: "tithonus", version: VERSION, description: "Signed time, notarisation and public randomness for agents. All GET, plain text." },
   servers: [{ url: ORIGIN }],
   paths: {
-    "/now": op("now", "Signed current UTC time."),
+    "/now": op("now", "Signed current UTC time, with the latest drand round as an outside lower bound."),
     "/now/{nonce}": op("nowNonce", "Signed current time with your nonce bound in.", [["nonce", "Any string; a fresh one beats caches."]]),
     "/stamp/{text}": op("stampText", "Notarise text; server salts and hashes it. Returns a receipt link.", [["text", "Percent-encoded text, up to 2000 chars."]]),
     "/ts/{sha256}": op("stampHash", "Notarise a sha256 you computed. Repeats return the first receipt.", [["sha256", "64 hex digits."]]),
     "/v/{sha256}": op("lookup", "Earliest receipt for a hash. Never creates.", [["sha256", "64 hex digits."]]),
     "/r/{receipt}": op("check", "Check a receipt link is genuine.", [["receipt", "<hash>.<unix>.<sig>[.<salt>]"]]),
     "/r/{receipt}/{text}": op("checkText", "Check a receipt and that it matches your text.", [["receipt", "<hash>.<unix>.<sig>[.<salt>]"], ["text", "Percent-encoded text."]]),
-    "/beacon": op("beacon", "Latest signed randomness."),
-    "/beacon/{round}": op("beaconRound", "Signed randomness for a past round.", [["round", `Unix seconds from ${GENESIS}.`]]),
+    "/beacon": op("beacon", "Latest drand randomness (League of Entropy), relayed and signed. Includes a token to put in text before stamping."),
+    "/beacon/{round}": op("beaconRound", "drand randomness for a past round.", [["round", "drand quicknet round number (one every 3 s)."]]),
     "/keys": op("keys", "Signing public keys."),
     "/stats": op("stats", "Signed self-test: four checks, each with measurement, limit and pass/fail, plus the canary stamp that evidences them."),
     "/canary": op("canary", "Newest canary: tithonus's own signed stats statement, stamped hourly through the normal Bitcoin pipeline."),
@@ -1123,6 +1245,7 @@ async function route(req, env, url) {
       if (rest === "mcp/server-card.json" || rest === "mcp.json") return { raw: SERVER_CARD(), type: "application/json" };
       if (rest === "agent-skills/index.json") return { raw: await skillsIndex(), type: "application/json" };
       if (rest === "agent-skills/tithonus/SKILL.md") return { raw: SKILL_MD, type: "text/markdown; charset=utf-8" };
+      if (rest === "security.txt") return { raw: SECURITY_TXT, type: "text/plain; charset=utf-8" };
       return result(`err path: unknown /.well-known/${rest}. try /.well-known/api-catalog or the manual at /\n`, 404);
     case "now":
       return doNow(env, rest ? decodeSafe(rest) : q.get("nonce") || undefined);
