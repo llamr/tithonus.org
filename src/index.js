@@ -6,7 +6,7 @@
 // POST /mcp is a zero-dependency MCP server (streamable HTTP, stateless, JSON responses).
 
 const V = "tithonus2";
-const VERSION = "3.5.0";
+const VERSION = "3.6.0";
 const KEY_ID = "1";
 const ORIGIN = "https://tithonus.org";
 const HEX64 = /^[0-9a-f]{64}$/;
@@ -32,14 +32,16 @@ url length: some fetch tools refuse urls over ~255 chars. keep /stamp text under
 /stats               signed self-test: 4 checks, each with its measurement, limit and pass/fail. refreshed every 10 minutes.
 /canary              every hour tithonus stamps its own signed stats statement like any stamp. this is the newest.
 /canary/<sha256hex>  one canary. sha256 of its bytes through the sig line is its hash; /ots/<hash> proves it in bitcoin.
+/a2a                 A2A agent (POST, JSON-RPC, A2A 1.0 and 0.3). send one text command: now, stamp <text>, check <link> <text>, beacon, or any path here. card: /.well-known/agent-card.json
 /mcp                 MCP server (POST, streamable HTTP). tools: tithonus_now, tithonus_stamp, tithonus_check, tithonus_lookup, tithonus_beacon
 /openapi.json        OpenAPI 3.1 spec for function calling
-discovery: /.well-known/api-catalog, /.well-known/mcp/server-card.json, /.well-known/agent-skills/index.json, /sitemap.xml, /auth.md (no account or key needed)
+discovery: /.well-known/api-catalog, /.well-known/mcp/server-card.json, /.well-known/agent-card.json, /.well-known/agent-skills/index.json, /sitemap.xml, /auth.md (no account or key needed)
 stale answer? fetch tools cache by url for hours. put /~<anything>/ in front of any path for a fresh one: /~a7/beacon, /~a7/v/<hash>
 verify: sig is ed25519 base64url over the exact bytes before the "sig " line (utf-8, \\n endings). lines after sig are unsigned hints.
 beacon: x = drand randomness = sha256(drand bls signature); verify with drand's public key, no tithonus needed. unix-second rounds 1791244800 to 1796083200 are the retired key-based beacon: still checkable, but the operator could compute them.
 not before: put a /beacon token (drand-<round>-<hex>) in your text, then stamp it. the receipt then bounds it both ways: written after the drand round, existed by the stamp time.
 stamp: hash = sha256("<salt>:<text>"). a receipt link carrying the salt lets anyone who has the text check it.
+limits: stamps only, about 20 a minute per address. reading, checking and time are never limited.
 "no" answers are 200 with an err line. trust: one operator key until a stamp is anchored in Bitcoin (hourly, then minutes to hours); after that, nobody. no stamp is ever deleted.
 key leak: if key 1 ever leaks, /keys will say so. stamps anchored in bitcoin before then stay proven; unanchored receipts and /now statements from that key prove nothing. the key itself is anchored hourly in /stats canaries.
 security reports: /.well-known/security.txt
@@ -747,6 +749,21 @@ async function drandAfter(text) {
   return { ok: true, at, line: `written after ${at}: the text carries drand round ${round}, which nobody could know before then` };
 }
 
+// ---------- write limit ----------
+// Only stamps write to storage, so only stamps are limited: connecting, listing tools, time, checks and lookups never
+// are, so directories and agents that probe tithonus are never shut out. Per address, approximate (Cloudflare's
+// Workers rate limiting binding, counted per location). No binding configured: no limit.
+async function writeLimit(env, req) {
+  if (!env.WRITE_LIMIT || !req) return null;
+  try {
+    const ip = req.headers.get("cf-connecting-ip") || "unknown";
+    const { success } = await env.WRITE_LIMIT.limit({ key: "stamp:" + ip });
+    return success ? null : errResult("slowdown", "too many stamps from your address in the last minute; nothing was stamped. wait a minute and retry. reads are never limited.");
+  } catch (_) {
+    return null; // the limiter failing must never stop the service
+  }
+}
+
 // ---------- core actions (shared by HTTP and MCP) ----------
 
 async function doNow(env, rawNonce) {
@@ -975,7 +992,7 @@ const TOOLS = [
       },
     },
     annotations: { title: "Notarise", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
-    run: (env, a) => (a.text ? doStampText(env, String(a.text), MAX_TEXT_MCP) : a.sha256 ? doStampHash(env, a.sha256) : errResult("badinput", "give text or sha256.")),
+    run: async (env, a, req) => (await writeLimit(env, req)) || (a.text ? doStampText(env, String(a.text), MAX_TEXT_MCP) : a.sha256 ? doStampHash(env, a.sha256) : errResult("badinput", "give text or sha256.")),
   },
   {
     name: "tithonus_check",
@@ -1038,7 +1055,7 @@ async function mcpOne(env, msg, req) {
       const p = msg.params || {};
       const tool = TOOL_BY_NAME[p.name];
       if (!tool) return fail(-32602, `unknown tool ${p.name}. tools: ${TOOLS.map((t) => t.name).join(", ")}`);
-      const r = await tool.run(env, p.arguments || {});
+      const r = await tool.run(env, p.arguments || {}, req);
       const isError = r.status >= 500 || r.body.startsWith("err ") || r.body.startsWith("invalid:");
       return reply({ content: [{ type: "text", text: r.body }], isError });
     }
@@ -1089,7 +1106,7 @@ description: Use when you need trustworthy current time, proof that you knew or 
 # tithonus.org
 
 Signed time, notarisation and public randomness. No account, no key. Every action is one GET on a path.
-If you can connect MCP servers, https://tithonus.org/mcp (streamable HTTP) has the same five tools.
+If you can connect MCP servers, https://tithonus.org/mcp (streamable HTTP) has the same five tools.\nA2A agents: card at https://tithonus.org/.well-known/agent-card.json, endpoint https://tithonus.org/a2a; send commands like "now" or "stamp <text>".
 
 ## Do this
 
@@ -1172,13 +1189,162 @@ const OPENAPI = JSON.stringify({
   },
 });
 
+// ---------- A2A (Agent2Agent): agent card + JSON-RPC endpoint ----------
+// Agents and crawlers look for /.well-known/agent-card.json (A2A 0.3+) and /.well-known/agent.json (older). The card
+// declares /a2a for A2A 1.0 and 0.3 over JSON-RPC. Every message is answered at once with a Message (no tasks, no
+// streaming). A message is one text command, a tithonus path, or a data part {"tool": ..., "arguments": {...}} that
+// mirrors the MCP tools. Answers are the same signed plain text as everywhere else.
+const A2A_URL = `${ORIGIN}/a2a`;
+const A2A_HELP =
+  'tithonus: send one command as text. now [nonce] | stamp <text> | ts <sha256> | check <receipt link> [text] | lookup <sha256> | beacon [round] | stats | keys | batches | canary [sha256] | help. ' +
+  'a tithonus.org path also works, e.g. /now/abc or /stamp/hello. answers are plain text; lines before "sig " are signed (ed25519, key at /keys).';
+const A2A_SKILLS = [
+  ["now", "Signed time", "Signed current UTC time, including the latest drand round, so it provably was made after it.", ["time", "clock", "signed", "drand"], ["now", "now my-nonce-123"]],
+  ["stamp", "Notarise", "Prove text existed by now. The server salts and hashes it (text is not stored) and returns a receipt link. Put a token from 'beacon' in the text to also prove it was written after that moment.", ["notarise", "timestamp", "proof", "receipt", "bitcoin"], ["stamp my prediction: X wins", "ts 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]],
+  ["check", "Check a receipt", "Is a receipt genuine, and is your text exactly what it covers? Plain match or no match.", ["verify", "receipt", "proof"], ["check https://tithonus.org/r/abcdef0123456789abcd.0123456789abcdef my prediction: X wins"]],
+  ["lookup", "Look up a hash", "Earliest receipt for a sha256 and its Bitcoin anchoring status. Never creates a stamp.", ["lookup", "hash", "receipt"], ["lookup 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"]],
+  ["beacon", "Public randomness", "drand randomness (League of Entropy), relayed and signed. Nobody can predict or choose it. Includes a token for 'written after' proofs.", ["randomness", "drand", "fair", "lottery"], ["beacon", "beacon 33314113"]],
+];
+const AGENT_CARD = () =>
+  JSON.stringify({
+    name: "tithonus",
+    description: "Signed time, Bitcoin-anchored notarisation and drand randomness for agents. No account, no key. Send one command as text: now, stamp <text>, check <link> <text>, lookup <sha256>, beacon.",
+    supportedInterfaces: [
+      { url: A2A_URL, protocolBinding: "JSONRPC", protocolVersion: "1.0" },
+      { url: A2A_URL, protocolBinding: "JSONRPC", protocolVersion: "0.3" },
+    ],
+    provider: { organization: "tithonus.org", url: `${ORIGIN}/` },
+    version: VERSION,
+    documentationUrl: `${ORIGIN}/`,
+    capabilities: { streaming: false, pushNotifications: false, extendedAgentCard: false },
+    defaultInputModes: ["text/plain", "application/json"],
+    defaultOutputModes: ["text/plain"],
+    skills: A2A_SKILLS.map(([id, name, description, tags, examples]) => ({ id, name, description, tags, examples })),
+    // A2A 0.3 clients read these top-level fields instead of supportedInterfaces
+    protocolVersion: "0.3.0",
+    url: A2A_URL,
+    preferredTransport: "JSONRPC",
+  });
+
+// One command -> { verb, r }. Text form "verb rest" or a path ("/verb/rest", with or without the origin).
+async function a2aRun(env, req, input) {
+  let t = String(input || "").trim();
+  t = t.replace(/^https?:\/\/(www\.)?tithonus\.org/i, "");
+  let verb, arg, path = false;
+  if (t.startsWith("/")) {
+    let parts = t.split("/").filter(Boolean);
+    if (parts[0] && parts[0].startsWith("~")) parts = parts.slice(1);
+    verb = (parts[0] || "").toLowerCase();
+    arg = decodeSafe(parts.slice(1).join("/"));
+    path = true;
+  } else {
+    const m = t.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+    verb = m ? m[1].toLowerCase() : "";
+    arg = m && m[2] !== undefined ? m[2] : "";
+  }
+  const run = async () => {
+    switch (verb) {
+      case "now":
+        return doNow(env, arg || undefined);
+      case "stamp":
+        return (await writeLimit(env, req)) || doStampText(env, arg, MAX_TEXT_MCP);
+      case "ts":
+        return (await writeLimit(env, req)) || doStampHash(env, arg);
+      case "check":
+      case "r": {
+        if (path) return doCheck(env, arg);
+        const m = arg.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+        if (!m) return errResult("badinput", "check needs a receipt link: check <link> [text]");
+        return doCheck(env, m[1], m[2] === undefined || m[2] === "" ? undefined : m[2]);
+      }
+      case "lookup":
+      case "v":
+        return doLookup(env, arg);
+      case "beacon":
+        return doBeacon(env, arg || undefined);
+      case "stats":
+        return doStats(env);
+      case "keys":
+        return doKeys(env);
+      case "batches":
+        return doBatches(env);
+      case "canary":
+        return doCanary(env, arg || null);
+      case "":
+      case "help":
+        return result(A2A_HELP + "\n");
+      default:
+        return errResult("badinput", `unknown command "${verb.slice(0, 40)}". ${A2A_HELP}`);
+    }
+  };
+  return { verb: ["now", "stamp", "ts", "check", "r", "lookup", "v", "beacon", "stats", "keys", "batches", "canary", "help"].includes(verb) ? verb : "other", r: await run() };
+}
+
+async function a2a(req, env) {
+  let p;
+  try {
+    p = await req.json();
+  } catch (_) {
+    return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
+  }
+  const id = p && typeof p === "object" && !Array.isArray(p) && p.id !== undefined ? p.id : null;
+  const fail = (code, message) => json({ jsonrpc: "2.0", id, error: { code, message } });
+  if (!p || typeof p !== "object" || Array.isArray(p) || p.jsonrpc !== "2.0" || typeof p.method !== "string") return fail(-32600, "invalid request (one JSON-RPC 2.0 object, no batches)");
+  const ver = (req.headers.get("a2a-version") || "").trim();
+  if (ver && !["0.3", "1.0"].includes(ver.split(".").slice(0, 2).join("."))) return fail(-32009, `A2A version ${ver} is not supported. supported: 1.0, 0.3`);
+  switch (p.method) {
+    case "SendMessage":
+    case "message/send": {
+      const msg = p.params && p.params.message;
+      if (!msg || !Array.isArray(msg.parts)) return fail(-32602, "params.message.parts is required");
+      const dataPart = msg.parts.find((x) => x && x.data && typeof x.data === "object" && !Array.isArray(x.data));
+      const text = msg.parts.filter((x) => x && typeof x.text === "string").map((x) => x.text).join("\n");
+      let verb, r;
+      if (dataPart && typeof dataPart.data.tool === "string") {
+        const name = dataPart.data.tool.startsWith("tithonus_") ? dataPart.data.tool : "tithonus_" + dataPart.data.tool;
+        const tool = TOOL_BY_NAME[name];
+        verb = tool ? name.replace(/^tithonus_/, "") : "other";
+        r = tool ? await tool.run(env, dataPart.data.arguments || {}, req) : errResult("badinput", `unknown tool "${String(dataPart.data.tool).slice(0, 40)}". tools: now, stamp, check, lookup, beacon.`);
+      } else {
+        ({ verb, r } = await a2aRun(env, req, dataPart && typeof dataPart.data.command === "string" ? dataPart.data.command : text));
+      }
+      count(env, "a2a:" + verb, req);
+      const messageId = crypto.randomUUID();
+      const ctx = typeof msg.contextId === "string" ? { contextId: msg.contextId } : {};
+      const result =
+        p.method === "message/send"
+          ? { kind: "message", messageId, role: "agent", parts: [{ kind: "text", text: r.body }], ...ctx }
+          : { message: { messageId, role: "ROLE_AGENT", parts: [{ text: r.body }], ...ctx } };
+      return json({ jsonrpc: "2.0", id, result });
+    }
+    case "SendStreamingMessage":
+    case "message/stream":
+      return fail(-32004, "streaming is not supported. use SendMessage (message/send): every answer is immediate.");
+    case "GetTask":
+    case "tasks/get":
+    case "ListTasks":
+    case "tasks/list":
+    case "CancelTask":
+    case "tasks/cancel":
+    case "SubscribeToTask":
+    case "tasks/resubscribe":
+      return fail(-32001, "task not found. tithonus answers every message immediately and keeps no tasks.");
+    case "GetExtendedAgentCard":
+    case "agent/getAuthenticatedExtendedCard":
+      return fail(-32007, "no extended agent card. the public card is at /.well-known/agent-card.json");
+    default:
+      if (/push/i.test(p.method)) return fail(-32003, "push notifications are not supported.");
+      return fail(-32601, `method not found: ${p.method.slice(0, 60)}. use SendMessage (A2A 1.0) or message/send (0.3).`);
+  }
+}
+
 // ---------- HTTP ----------
 
 function cors() {
   return {
     "access-control-allow-origin": "*",
     "access-control-allow-methods": "GET, HEAD, POST, OPTIONS",
-    "access-control-allow-headers": "content-type, accept, mcp-protocol-version, mcp-session-id",
+    "access-control-allow-headers": "content-type, accept, mcp-protocol-version, mcp-session-id, a2a-version, a2a-extensions",
   };
 }
 
@@ -1211,11 +1377,11 @@ function vendor(ua) {
 
 // Only known services are recorded by name; anything else (scanner probes for .env, wp-admin, ...) is "unknown",
 // so stats stay readable and no attacker-chosen string is stored.
-const KNOWN = new Set(["manual", "llms.txt", "robots.txt", "sitemap.xml", "openapi.json", "auth.md", ".well-known", "now", "stamp", "ts", "v", "r", "beacon", "keys", "ots", "batches", "stats", "canary", "mcp"]);
+const KNOWN = new Set(["manual", "llms.txt", "robots.txt", "sitemap.xml", "openapi.json", "auth.md", ".well-known", "now", "stamp", "ts", "v", "r", "beacon", "keys", "ots", "batches", "stats", "canary", "mcp", "a2a"]);
 
 function count(env, verb, req) {
   if (!env.STATS) return;
-  if (!verb.startsWith("mcp:") && !KNOWN.has(verb)) verb = "unknown";
+  if (!verb.startsWith("mcp:") && !verb.startsWith("a2a:") && !KNOWN.has(verb)) verb = "unknown";
   try {
     env.STATS.writeDataPoint({ blobs: [verb, vendor(req.headers.get("user-agent"))], doubles: [1], indexes: [verb] });
   } catch (_) {}
@@ -1246,13 +1412,14 @@ async function route(req, env, url) {
       if (rest === "agent-skills/index.json") return { raw: await skillsIndex(), type: "application/json" };
       if (rest === "agent-skills/tithonus/SKILL.md") return { raw: SKILL_MD, type: "text/markdown; charset=utf-8" };
       if (rest === "security.txt") return { raw: SECURITY_TXT, type: "text/plain; charset=utf-8" };
+      if (rest === "agent-card.json" || rest === "agent.json") return { raw: AGENT_CARD(), type: "application/json" };
       return result(`err path: unknown /.well-known/${rest}. try /.well-known/api-catalog or the manual at /\n`, 404);
     case "now":
       return doNow(env, rest ? decodeSafe(rest) : q.get("nonce") || undefined);
     case "stamp":
-      return doStampText(env, rest ? decodeSafe(rest) : q.get("text") || "", MAX_TEXT_URL);
+      return (await writeLimit(env, req)) || doStampText(env, rest ? decodeSafe(rest) : q.get("text") || "", MAX_TEXT_URL);
     case "ts":
-      return doStampHash(env, decodeSafe(rest));
+      return (await writeLimit(env, req)) || doStampHash(env, decodeSafe(rest));
     case "v":
       return doLookup(env, decodeSafe(rest));
     case "r":
@@ -1279,6 +1446,8 @@ async function route(req, env, url) {
       if (o.err) return o.err;
       return { bin: o.file, name: `${h}.ots`, cache: o.complete ? "public, max-age=86400" : "no-store" };
     }
+    case "a2a":
+      return result("a2a: this is an A2A agent endpoint. POST JSON-RPC 2.0 (SendMessage for A2A 1.0, message/send for 0.3). agent card: https://tithonus.org/.well-known/agent-card.json. without A2A, every command is also a plain GET: see /\n");
     case "mcp":
       return result("mcp: this is an MCP server. connect your MCP client to https://tithonus.org/mcp (POST, streamable HTTP). without MCP, every tool is also a plain GET: see /\n");
     default:
@@ -1309,7 +1478,15 @@ export default {
       }
     }
 
-    if (req.method !== "GET" && req.method !== "HEAD") return text(errResult("method", "GET only (POST only on /mcp).", 405));
+    if ((url.pathname === "/a2a" || url.pathname === "/a2a/") && req.method === "POST") {
+      try {
+        return await a2a(req, env);
+      } catch (_) {
+        return json({ jsonrpc: "2.0", id: null, error: { code: -32603, message: "server error, retry shortly" } }, 500);
+      }
+    }
+
+    if (req.method !== "GET" && req.method !== "HEAD") return text(errResult("method", "GET only (POST only on /mcp and /a2a).", 405));
 
     let r;
     try {
